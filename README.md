@@ -10,7 +10,7 @@ The layout string tmux prints cannot be replayed. Those numbers are live pane id
 curl -fsSL https://raw.githubusercontent.com/suxatcode/tmux-session/main/install.sh | sh
 ```
 
-That puts `tmux-session-save`, `tmux-session-start`, and `tmux-session.py` in `~/.local/bin`. Override the directory with `TMUX_SESSION_INSTALL_DIR`.
+That puts `tmux-session-save`, `tmux-session-start`, `tmux-session-theme-restart`, and `tmux-session.py` in `~/.local/bin`. Override the directory with `TMUX_SESSION_INSTALL_DIR`.
 
 Needs `python3`, `tmux`, and `lsof` (used when an agent process does not show `--resume=` on its command line). `~/.local/bin` must be on `PATH`.
 
@@ -30,6 +30,8 @@ tmux-session-start
 
 `start` attaches when you are not already inside tmux. It refuses to open a second copy of an agent chat that is still running. Pass `--force` only when you mean to.
 
+An agent pane's `TERM_THEME` is stored when that process has it set, and `start` launches the agent with the same value (`TERM_THEME=dark agent --resume=<id>`). The value comes from the agent process, not the pane's shell. A theme exported in the shell after the agent started is not stored. On macOS the process environment is space-separated, so a value that contains spaces does not round-trip. `dark` and `light` do.
+
 ```bash
 tmux-session-save --session 0
 tmux-session-start --dry-run
@@ -45,6 +47,16 @@ Empty shells stay empty. A pane is restarted only when relaunching its command d
 - `kubectl delete`, `docker run`, `python3 script.py`, `make`, and anything else not known to be passive are left as a shell in the saved directory.
 
 An ssh config `RemoteCommand` is not visible in the process arguments, so a plain `ssh host` can still run whatever that config says.
+
+## Switch the theme of running agents
+
+```bash
+tmux-session-theme-restart dark
+```
+
+This finds every Cursor agent pane on the current tmux server and restarts it as `TERM_THEME=dark agent --resume=<id>`. You do not have to be attached. It does not rewrite the session file. Run `tmux-session-save` afterwards if the next `tmux-session-start` should use the new theme.
+
+The restart kills the agent process, so an in-flight turn is lost. The chat comes back through `--resume`. Two panes resumed onto the same chat are both restarted.
 
 ## Where the session is stored
 

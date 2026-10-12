@@ -4,8 +4,9 @@
 The layout string tmux prints cannot be replayed: the numbers in it are pane
 ids from the live session. Geometry is stored instead, and restore splits
 along the same seams. Each agent pane records the chat id so `agent --resume`
-opens that same conversation. Other foreground programs are restored only when
-starting them again does not itself change local or remote state.
+opens that same conversation, and records TERM_THEME when that process has it
+set. Other foreground programs are restored only when starting them again does
+not itself change local or remote state.
 """
 
 import argparse
@@ -100,18 +101,75 @@ def chat_id_from_open_store(pid):
     return Path(path).parent.name
 
 
-def agent_id_for_shell(shell_pid, children, commands):
+def agent_for_shell(shell_pid, children, commands):
+    """Return (pid, agent_id) for the cursor agent in this pane, or (None, None)."""
     candidates = [shell_pid, *children.get(shell_pid, [])]
     for pid in candidates:
         command = commands.get(pid, "")
         found = resume_from_command(command)
         if found:
-            return found
+            return pid, found
         if "cursor-agent" in command or command.endswith(" agent") or "/agent " in command:
             found = chat_id_from_open_store(pid)
             if found:
-                return found
-    return None
+                return pid, found
+    return None, None
+
+
+def environ_from_proc(raw):
+    result = {}
+    for item in raw.split(b"\0"):
+        key, sep, value = item.partition(b"=")
+        if not sep:
+            continue
+        result[key.decode(errors="replace")] = value.decode(errors="replace")
+    return result
+
+
+def environ_from_ps(plain, full):
+    """Environment from macOS `ps -E`, which appends it after the command.
+
+    Entries are space-separated, so a value that contains spaces is cut at
+    the first space.
+    """
+    plain = plain.rstrip("\n")
+    full = full.rstrip("\n")
+    if not plain or not full.startswith(plain):
+        return {}
+    result = {}
+    for token in full[len(plain):].split():
+        key, sep, value = token.partition("=")
+        if sep and key:
+            result[key] = value
+    return result
+
+
+def _ps_command(pid, with_env):
+    result = subprocess.run(
+        ["ps", "-Eww" if with_env else "-ww", "-p", str(pid), "-o", "command="],
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def term_theme_of(pid):
+    proc = Path(f"/proc/{pid}/environ")
+    if proc.is_file():
+        try:
+            env = environ_from_proc(proc.read_bytes())
+        except OSError:
+            return None
+    else:
+        plain = _ps_command(pid, with_env=False)
+        full = _ps_command(pid, with_env=True)
+        if plain is None or full is None:
+            return None
+        env = environ_from_ps(plain, full)
+    theme = env.get("TERM_THEME")
+    return theme or None
 
 
 def foreground_command(shell_pid, children, commands):
@@ -794,7 +852,7 @@ def _db_client(tokens, name):
 
 def pane_record(fields, children, commands):
     shell_pid = fields["pid"]
-    agent_id = agent_id_for_shell(shell_pid, children, commands)
+    agent_pid, agent_id = agent_for_shell(shell_pid, children, commands)
     record = {
         "index": int(fields["index"]),
         "left": int(fields["left"]),
@@ -808,6 +866,9 @@ def pane_record(fields, children, commands):
         record["kind"] = "agent"
         record["agent_id"] = agent_id
         record["command"] = f"agent --resume={agent_id}"
+        theme = term_theme_of(agent_pid)
+        if theme:
+            record["term_theme"] = theme
         return record
     command = foreground_command(shell_pid, children, commands)
     kind = classify_restorable(command) if command else None
@@ -965,11 +1026,33 @@ def apply_tree(session, node, target):
     return pending
 
 
-def launch_command(pane_id, command):
+def command_with_term_theme(command, term_theme):
+    if not term_theme:
+        return command
+    return f"TERM_THEME={shlex.quote(term_theme)} {command}"
+
+
+def launch_command(pane_id, command, term_theme=None):
     # One argument so tmux's shell sees the quotes. Interactive zsh loads the
     # environment agent needs, and the pane stays open after that program exits.
+    # The assignment applies only to the resumed program, after zshrc has run.
+    command = command_with_term_theme(command, term_theme)
     script = "zsh -ic " + shlex.quote(command + "; exec zsh -i")
     tmux("respawn-pane", "-k", "-t", pane_id, script)
+
+
+def agent_panes(pane_rows, children, commands):
+    """Return (pane_id, agent_id) for each pane that has a cursor agent.
+
+    pane_rows are (pane_id, pane_pid). Two panes on the same chat are both
+    included.
+    """
+    found = []
+    for pane_id, pane_pid in pane_rows:
+        _pid, agent_id = agent_for_shell(str(pane_pid), children, commands)
+        if agent_id:
+            found.append((pane_id, agent_id))
+    return found
 
 
 def live_agent_ids():
@@ -995,6 +1078,8 @@ def restore(data, session_name, attach, dry_run, force):
             print(f"  window {window['index']} {window['name']}")
             for pane in window["panes"]:
                 command = pane.get("command") or "(shell)"
+                if pane.get("command") and pane.get("term_theme"):
+                    command = command_with_term_theme(pane["command"], pane["term_theme"])
                 print(f"    pane {pane['index']} {pane['kind']}: {command}")
         return
 
@@ -1058,7 +1143,7 @@ def restore(data, session_name, attach, dry_run, force):
     for pane_id, pane in pending:
         command = pane.get("command")
         if command:
-            launch_command(pane_id, command)
+            launch_command(pane_id, command, pane.get("term_theme"))
     tmux("select-window", "-t", f"{name}:{windows[0]['index']}")
     if attach and not os.environ.get("TMUX"):
         os.execvp("tmux", ["tmux", "attach", "-t", name])
@@ -1078,6 +1163,24 @@ def start(args):
     path = args.file.expanduser()
     data = json.loads(path.read_text())
     restore(data, args.session, attach=not args.no_attach, dry_run=args.dry_run, force=args.force)
+
+
+def theme_restart(args):
+    listed = tmux("list-panes", "-a", "-F", "#{pane_id}\t#{pane_pid}")
+    rows = []
+    for line in listed.stdout.splitlines():
+        if not line.strip():
+            continue
+        pane_id, pane_pid = line.split("\t", 1)
+        rows.append((pane_id, pane_pid))
+    children, commands = process_table()
+    panes = agent_panes(rows, children, commands)
+    if not panes:
+        print("no agent panes found")
+        return
+    for pane_id, agent_id in panes:
+        launch_command(pane_id, f"agent --resume={agent_id}", args.theme)
+        print(f"restarted {agent_id} with TERM_THEME={shlex.quote(args.theme)}")
 
 
 def main():
@@ -1101,6 +1204,13 @@ def main():
     start_parser.add_argument("--dry-run", action="store_true")
     start_parser.add_argument("--force", action="store_true", help="start even if those agents are already running")
     start_parser.set_defaults(func=start)
+
+    theme_parser = sub.add_parser(
+        "theme-restart",
+        help="restart every Cursor agent pane with TERM_THEME set",
+    )
+    theme_parser.add_argument("theme", help="value to assign to TERM_THEME")
+    theme_parser.set_defaults(func=theme_restart)
 
     args = parser.parse_args()
     args.func(args)

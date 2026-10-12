@@ -31,11 +31,11 @@ install_one() {
   mv "$tmp" "$dest/$name"
 }
 
-for name in tmux-session.py tmux-session-save tmux-session-start; do
+for name in tmux-session.py tmux-session-save tmux-session-start tmux-session-theme-restart; do
   install_one "$name"
 done
 
-echo "Installed tmux-session-save and tmux-session-start into $dest"
+echo "Installed tmux-session-save, tmux-session-start, and tmux-session-theme-restart into $dest"
 echo "Session file: \${TMUX_SESSION_FILE:-\$HOME/.local/tmux-session.json}"
 
 case ":$PATH:" in

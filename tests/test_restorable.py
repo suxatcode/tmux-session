@@ -7,6 +7,7 @@ launch must stay a plain shell, even if it looks similar to an allowed one.
 import importlib.util
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 _SPEC = importlib.util.spec_from_file_location(
     "tmux_session", Path(__file__).resolve().parents[1] / "tmux-session.py"
@@ -218,14 +219,65 @@ class RestoreDecisionTest(unittest.TestCase):
         self.assertEqual(nvim["command"], "/opt/homebrew/bin/nvim -R notes.md")
 
     def test_agent_pane_still_resumes_the_chat(self):
-        record = tmux_session.pane_record(
-            _pane(),
-            {"10": ["11"]},
-            {"11": "/Users/me/.local/bin/cursor-agent --resume=chat-123"},
-        )
+        with patch.object(tmux_session, "term_theme_of", return_value=None):
+            record = tmux_session.pane_record(
+                _pane(),
+                {"10": ["11"]},
+                {"11": "/Users/me/.local/bin/cursor-agent --resume=chat-123"},
+            )
         self.assertEqual(record["kind"], "agent")
         self.assertEqual(record["agent_id"], "chat-123")
         self.assertEqual(record["command"], "agent --resume=chat-123")
+        self.assertNotIn("term_theme", record)
+
+    def test_agent_pane_stores_term_theme(self):
+        with patch.object(tmux_session, "term_theme_of", return_value="dark"):
+            record = tmux_session.pane_record(
+                _pane(),
+                {"10": ["11"]},
+                {"11": "/Users/me/.local/bin/cursor-agent --resume=chat-123"},
+            )
+        self.assertEqual(record["term_theme"], "dark")
+        self.assertEqual(record["command"], "agent --resume=chat-123")
+
+    def test_command_with_term_theme_quotes_the_value(self):
+        resume = "agent --resume=chat-123"
+        self.assertEqual(
+            tmux_session.command_with_term_theme(resume, "dark"),
+            "TERM_THEME=dark agent --resume=chat-123",
+        )
+        self.assertEqual(
+            tmux_session.command_with_term_theme(resume, "dark mode"),
+            "TERM_THEME='dark mode' agent --resume=chat-123",
+        )
+        self.assertEqual(tmux_session.command_with_term_theme(resume, None), resume)
+        self.assertEqual(tmux_session.command_with_term_theme(resume, ""), resume)
+
+    def test_environ_readers(self):
+        proc = tmux_session.environ_from_proc(b"TERM_THEME=dark mode\0HOME=/Users/me\0\0")
+        self.assertEqual(proc["TERM_THEME"], "dark mode")
+        plain = "python3 -c import time; time.sleep(30)\n"
+        full = plain.rstrip("\n") + " TERM_THEME=probe-theme OTHER=dark mode\n"
+        ps = tmux_session.environ_from_ps(plain, full)
+        self.assertEqual(ps["TERM_THEME"], "probe-theme")
+        self.assertEqual(ps["OTHER"], "dark")
+        self.assertEqual(tmux_session.environ_from_ps("", full), {})
+        self.assertEqual(tmux_session.environ_from_ps(plain, "other command\n"), {})
+
+    def test_agent_panes_selects_only_agent_panes(self):
+        children = {"10": ["11"], "20": ["21"], "30": ["31"]}
+        commands = {
+            "10": "-zsh",
+            "11": "/Users/me/.local/bin/cursor-agent --resume=chat-1",
+            "20": "-zsh",
+            "21": "vim main.py",
+            "31": "agent --resume=chat-1",
+        }
+        rows = [("%1", "10"), ("%2", "20"), ("%3", "30")]
+        self.assertEqual(
+            tmux_session.agent_panes(rows, children, commands),
+            [("%1", "chat-1"), ("%3", "chat-1")],
+        )
 
 
 if __name__ == "__main__":
